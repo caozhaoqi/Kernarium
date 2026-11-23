@@ -57,6 +57,25 @@ namespace census = ::uml::cpu::gadget_cache::census;
 #endif
 namespace {
 
+/* LOCAL PATCH (2026-11-23, 非上游代码) —— 绕开 AppleClang 17 / macOS 27 SDK
+ * 的前端 bug：删除器若是**嵌套类型**（原来的 ProgramCache::SlabDelete），
+ * `std::array<std::unique_ptr<Slab, 该删除器>, 1024>` 会被判定为不可默认
+ * 构造，于是 ProgramCache 的构造函数（:1498）在隐式初始化 slabs_ 时编译失败。
+ * 把删除器搬到文件作用域（对嵌套类型只做模板参数），问题消失。
+ * `is_default_constructible_v` 在命名空间作用域为 true、在嵌套上下文为
+ * false 的最小复现随本次构建记录一并留档。 */
+template <class T>
+struct HeapRelease final {
+	::uml::memory::DomainHeap *heap{};
+	std::size_t size{};
+	std::size_t align{};
+	void operator()(T *object) const noexcept
+	{
+		object->~T();
+		heap->deallocate(object, size, align);
+	}
+};
+
 
 /* darwin/cpu/CMakeLists.txt defines it for this translation unit, the only
  * one that reads it. */
@@ -2224,16 +2243,8 @@ private:
 		std::array<Slot, slab_slots> slots;
 	};
 	/* Slabs come from the cache's own heap, which a cache that ends gives back
-	 * whole. */
-	struct SlabDelete final {
-		::uml::memory::DomainHeap *heap{};
-		void operator()(Slab *slab) const noexcept
-		{
-			slab->~Slab();
-			heap->deallocate(slab, sizeof(Slab), alignof(Slab));
-		}
-	};
-	using SlabPointer = std::unique_ptr<Slab, SlabDelete>;
+	 * whole; the deleter lives at file scope (see HeapRelease, LOCAL PATCH). */
+	using SlabPointer = std::unique_ptr<Slab, HeapRelease<Slab>>;
 
 	struct Location final {
 		std::size_t set;
@@ -2566,7 +2577,9 @@ private:
 		auto &slab = slabs_[location.slab];
 		if (!slab)
 			slab = SlabPointer{new (slab_heap_.allocate(sizeof(Slab),
-				alignof(Slab))) Slab{}, SlabDelete{&slab_heap_}};
+				alignof(Slab))) Slab{},
+				HeapRelease<Slab>{&slab_heap_, sizeof(Slab),
+					alignof(Slab)}};
 		auto &replacement = next_replacement_[location.set];
 		std::size_t selected = replacement;
 		for (std::size_t way = 0; way < ways; ++way) {
